@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: visa-checker-bot
+    env: node
+    region: virginia  # or oregon (both are near the US visa servers)
+    plan: free
+    buildCommand: npm install
+    startCommand: node visa-checker.js
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000

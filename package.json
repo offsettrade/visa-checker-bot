@@ -1,0 +1,13 @@
+{
+  "name": "visa-checker-bot",
+  "version": "1.0.0",
+  "main": "visa-checker.js",
+  "type": "module",
+  "scripts": {
+    "start": "node visa-checker.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
+}
