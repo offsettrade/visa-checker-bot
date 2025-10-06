@@ -1,236 +1,158 @@
 import express from "express";
 import fetch from "node-fetch";
-import fs from "fs/promises";
+import fs from "fs";
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-// Load config
-let config = JSON.parse(await fs.readFile("./config.json", "utf8"));
+// Load configuration
+const config = JSON.parse(fs.readFileSync("./config.json", "utf8"));
 
-// Global state
-let rescheduling = false;
-let noDatesLogged = false;
-let pollingInterval = null;
-let pollingActive = false;
+const {
+  token,
+  applicantId,
+  applicationId,
+  postUserId,
+  visaType,
+  visaClass,
+  appointmentId,
+  pollInterval,
+  parallelAttempts,
+  maxRetries,
+  preferredStartDate,
+  preferredEndDate,
+} = config;
 
-// ---------------------- API FUNCTIONS ----------------------
-async function getSlotDates(fromDate, toDate, input) {
-  try {
-    const resp = await fetch(
-      "https://www.usvisaappt.com/visaadministrationapi/v1/modifyslot/getSlotDates",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${input.token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json, text/plain, */*",
-          Origin: "https://www.usvisaappt.com",
-          Referer: "https://www.usvisaappt.com/visaapplicantui/home/appointment/slot",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        },
-        body: JSON.stringify({
-          fromDate,
-          toDate,
-          postUserId: +input.postUserId,
-          applicantId: input.applicantId,
-          applicationId: input.applicationId,
-          locationType: "POST",
-          visaClass: input.visaClass,
-          visaType: input.visaType,
-        }),
-      }
-    );
+// Core API URLs
+const API_BASE = "https://www.usvisaappt.com/visaappointmentapi";
+const RESCHEDULE_URL = `${API_BASE}/appointments/reschedule`;
+const AVAILABLE_SLOTS_URL = `${API_BASE}/slots/available`;
 
-    if (resp.status === 401) {
-      console.log("⚠️ Token expired. Capture new token to continue.");
-      return null;
-    }
-    if (resp.status === 403) return null;
-    if (resp.status === 404) return [];
+let pollingActive = true;
 
-    const text = await resp.text();
-    try {
-      const data = JSON.parse(text);
-      return Array.isArray(data) ? data : null;
-    } catch {
-      return null;
-    }
-  } catch {
-    return null;
-  }
-}
+/**
+ * Fetch available slots for your visa type and post location
+ */
+async function fetchAvailableSlots() {
+  const url = `${AVAILABLE_SLOTS_URL}?appointmentId=${appointmentId}&postUserId=${postUserId}&visaType=${visaType}&visaClass=${visaClass}`;
 
-async function getSlotTimes(fromDate, toDate, slotDate, input) {
-  try {
-    const resp = await fetch(
-      "https://www.usvisaappt.com/visaadministrationapi/v1/modifyslot/getSlotTime",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${input.token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json, text/plain, */*",
-          Origin: "https://www.usvisaappt.com",
-          Referer: "https://www.usvisaappt.com/visaapplicantui/home/appointment/slot",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        },
-        body: JSON.stringify({
-          fromDate,
-          toDate,
-          slotDate,
-          postUserId: +input.postUserId,
-          applicantId: input.applicantId,
-          applicationId: input.applicationId,
-          visaClass: input.visaClass,
-          visaType: input.visaType,
-        }),
-      }
-    );
-
-    if (resp.status === 401) return null;
-    const text = await resp.text();
-    try {
-      const data = JSON.parse(text);
-      return Array.isArray(data) ? data : null;
-    } catch {
-      return null;
-    }
-  } catch {
-    return null;
-  }
-}
-
-async function rescheduleAppointment(slot, input) {
-  const startDate = new Date(slot.startTime);
-  const appointmentTime = startDate.toLocaleTimeString("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-    timeZone: "UTC",
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
   });
 
-  const payload = {
-    applicantId: input.applicantId,
-    applicationId: input.applicationId,
-    postUserId: +input.postUserId,
-    appointmentId: +input.appointmentId,
-    appointmentDt: slot.slotDate,
-    appointmentTime,
-    slotId: slot.slotId,
-    fromDate: input.preferredStartDate,
-    toDate: input.preferredEndDate,
-    visaType: input.visaType,
-    visaClass: input.visaClass,
-  };
+  if (!res.ok) {
+    console.error("❌ Failed to fetch slots:", res.status, await res.text());
+    return [];
+  }
 
-  const resp = await fetch(
-    "https://www.usvisaappt.com/visaappointmentapi/appointments/reschedule",
+  const data = await res.json();
+  return data?.slots || [];
+}
+
+/**
+ * Attempt to reschedule appointment
+ */
+async function attemptReschedule(slotId, appointmentDt, appointmentTime) {
+  const payload = [
     {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${input.token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify([payload]),
-    }
-  );
+      appointmentId,
+      applicantId,
+      applicationId,
+      postUserId,
+      appointmentLocationType: "POST",
+      appointmentDt,
+      appointmentTime,
+      rescheduleType: "POST",
+      slotId,
+      appointmentStatus: "SCHEDULED",
+      applicantUUID: null,
+    },
+  ];
 
-  return resp.json();
-}
-
-async function tryRescheduleParallel(slots, input) {
-  const attempts = slots.map(async (slot) => {
-    let retries = 0;
-    while (retries < config.maxRetries) {
-      retries++;
-      console.log(`⚡ Attempting reschedule (slot ${slot.slotId}, try ${retries})`);
-      const result = await rescheduleAppointment(slot, input);
-      if (result?.status === 409) continue; // retry
-      return result;
-    }
-    return { error: "Max retries reached for slot " + slot.slotId };
+  const res = await fetch(RESCHEDULE_URL, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
   });
 
-  return Promise.any(attempts).catch(() => null);
+  const text = await res.text();
+  console.log(`⚡ Reschedule Response (${res.status}):`, text);
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
-// ---------------------- POLLING ----------------------
-async function pollSlots(input) {
-  if (rescheduling) return;
+/**
+ * Main polling function
+ */
+async function pollForSlots() {
+  let retries = 0;
 
-  const dates = await getSlotDates(input.preferredStartDate, input.preferredEndDate, input);
+  while (pollingActive) {
+    try {
+      const slots = await fetchAvailableSlots();
+      const validSlots = slots.filter((s) => {
+        const date = new Date(s.appointmentDt);
+        return (
+          date >= new Date(preferredStartDate) &&
+          date <= new Date(preferredEndDate)
+        );
+      });
 
-  if (!dates || !dates.length) {
-    if (!noDatesLogged) {
-      console.log("ℹ️ No available dates yet. Continuing silently...");
-      noDatesLogged = true;
+      if (validSlots.length > 0) {
+        console.log("✅ Found slots:", validSlots.map((s) => `${s.appointmentDt} ${s.appointmentTime}`));
+
+        for (let i = 0; i < Math.min(parallelAttempts, validSlots.length); i++) {
+          const slot = validSlots[i];
+          console.log(`⚡ Attempting reschedule (slot ${slot.slotId}, try ${retries + 1})`);
+          const result = await attemptReschedule(slot.slotId, slot.appointmentDt, slot.appointmentTime);
+
+          if (result && result[0]?.appointmentStatus === "SCHEDULED") {
+            console.log("🎉 Successfully rescheduled:", result[0]);
+            pollingActive = false;
+            console.log("⏹️ Polling stopped after successful reschedule.");
+            return;
+          }
+        }
+      } else {
+        console.log("⏳ No suitable slots found yet...");
+      }
+    } catch (err) {
+      console.error("⚠️ Error in polling loop:", err);
     }
-    return;
+
+    retries++;
+    if (retries >= maxRetries) {
+      console.log("🛑 Max retries reached. Stopping polling.");
+      pollingActive = false;
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, pollInterval * 1000));
   }
+}
 
-  noDatesLogged = false;
-
-  const timesResults = await Promise.all(
-    dates.map((d) => {
-      const dateString = typeof d === "string" ? d.split("T")[0] : d.date.split("T")[0];
-      return getSlotTimes(input.preferredStartDate, input.preferredEndDate, dateString, input);
-    })
+// Express endpoint for status
+app.get("/", (req, res) => {
+  res.send(
+    pollingActive
+      ? "🤖 Visa Checker Bot is running and polling for slots..."
+      : "✅ Visa Checker Bot has stopped polling."
   );
-
-  const allSlots = timesResults.flat().filter((s) => s.slotStatus === "UNBOOKED");
-  if (!allSlots.length) return;
-
-  allSlots.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-  const bestSlots = allSlots.slice(0, config.parallelAttempts);
-  console.log("✅ Found slots:", bestSlots.map((s) => s.slotDate + " " + s.startTime));
-
-  rescheduling = true;
-  const result = await tryRescheduleParallel(bestSlots, input);
-  console.log("🎉 First successful reschedule result:", result);
-
-  if (!result?.error && !result?.status) {
-    stopPolling();
-    console.log("🛑 Polling stopped after successful reschedule.");
-  } else {
-    rescheduling = false;
-  }
-}
-
-function startPolling(input) {
-  if (pollingActive) {
-    console.log("⚠️ Polling already running.");
-    return;
-  }
-  const interval = 600;
-  console.log(`🚀 Starting ultra-fast polling (every ${interval} ms)...`);
-  pollingInterval = setInterval(() => pollSlots(input), interval);
-  pollingActive = true;
-}
-
-function stopPolling() {
-  if (pollingInterval) clearInterval(pollingInterval);
-  pollingActive = false;
-  rescheduling = false;
-  console.log("⏹️ Polling stopped.");
-}
-
-// ---------------------- EXPRESS STATUS SERVER ----------------------
-app.get("/status", (req, res) => {
-  res.json({
-    polling: pollingActive,
-    rescheduling,
-    config,
-  });
 });
 
-// ---------------------- AUTO START ----------------------
-const PORT = process.env.PORT || 3000;
+// Start server and polling
 app.listen(PORT, () => {
-  console.log(`🌐 Local control server running at http://localhost:${PORT}`);
-  console.log("📡 Auto-starting polling...");
-  startPolling(config);
+  console.log(`🚀 Server running on port ${PORT}`);
+  pollForSlots();
 });
